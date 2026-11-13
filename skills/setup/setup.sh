@@ -24,7 +24,7 @@ else
   echo "AGENTS.md создан из шаблона: заполните разделы."
 fi
 
-for dir in spec/actual spec/archive; do
+for dir in spec/actual spec/archive docs; do
   if [ -d "$dir" ]; then
     echo "$dir есть."
   else
@@ -43,6 +43,6 @@ fi
 
 for claude in CLAUDE.md .claude/CLAUDE.md; do
   if [ -e "$claude" ] && ! grep -q '@AGENTS.md' "$claude"; then
-    echo "В $claude нет строки @AGENTS.md: без неё Claude Code не читает AGENTS.md — добавьте её первой строкой."
+    echo "В $claude нет строки @AGENTS.md: без неё Claude Code не читает AGENTS.md, добавьте её первой строкой."
   fi
 done

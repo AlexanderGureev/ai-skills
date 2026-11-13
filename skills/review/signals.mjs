@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Сигналы роста сложности в диффе: где вырос код, какие точки сборки и манифесты задеты, какие экспорты без
-// потребителя, какие файлы скопированы и какие конструкции добавлены. Сигнал — вопрос ревьюеру, а не приговор.
-// Без аргументов — staged, а если он пуст — всё незакоммиченное. Иначе аргументы git diff: `HEAD` (всё
-// незакоммиченное, с новыми файлами вне git), `HEAD~1..HEAD`, `main...`. После `--` — пути: `HEAD -- src/a.ts`.
+// потребителя, какие файлы скопированы и какие конструкции добавлены. Сигнал является вопросом ревьюеру, а не приговором.
+// Без аргументов берётся staged, а если он пуст, всё незакоммиченное. Иначе аргументы git diff: `HEAD` (всё
+// незакоммиченное, с новыми файлами вне git), `HEAD~1..HEAD`, `main...`. После `--` идут пути: `HEAD -- src/a.ts`.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -15,7 +15,7 @@ const GENERATED =
   /(^|\/)(generated|__generated__|gen|dist|build|out|vendor|node_modules|\.next|target)\/|\.(gen|g|freezed|generated|designer)\.|_pb2?\.|\.pb\.|\.min\.|(^|\/|-|\.)lock(file)?\.(json|yaml|yml)$|\.lock$/i;
 const TEST_FILE =
   /(\.|_)(test|spec)\.\w+$|[a-z0-9](Tests?|Spec)\.\w+$|(^|\/)([Tt]ests?|__tests__|e2e|scenarios|fixtures|mocks?|androidTest|testFixtures)\/|(^|\/)test_\w+\.py$/;
-// Каталоги монорепы, где модуль — второй сегмент пути (`packages/core`), а не первый.
+// Каталоги монорепы, где модуль задаёт второй сегмент пути (`packages/core`), а не первый.
 const WORKSPACE_DIRS = new Set(["apps", "packages", "libs", "services", "tools", "modules", "crates", "plugins", "cmd"]);
 // Точки сборки, store, codec и входы: растут с каждой фичей, расти должны только связыванием.
 const HUB_NAME =
@@ -26,11 +26,11 @@ const MANIFEST_FILE =
 const MANIFEST_VERSION = /^[+-]\s*"?version"?\s*[:=]/;
 const JS_EXPORT =
   /^\s*export\s+(?:default\s+)?(?:declare\s+)?(?:async\s+)?(?:function\*?|const|let|class|abstract\s+class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/;
-// `#` — только с пробелом: `#private` в TS и `#include` в C — код, а не комментарий.
+// `#` считается комментарием только с пробелом: `#private` в TS и `#include` в C являются кодом.
 const COMMENT_LINE = /^\s*(\/\/|#(\s|$)|\*|\/\*|--\s)/;
 const LARGE_FILE_LINES = 600;
 const BIG_GROWTH_LINES = 150;
-// Средний файл, выросший на четверть, — тот же признак второй ответственности, что и большой рост.
+// Средний файл, выросший на четверть, даёт тот же признак второй ответственности, что и большой рост.
 const RELATIVE_GROWTH = 0.25;
 const RELATIVE_GROWTH_LINES = 60;
 const EXAMPLES_PER_SIGNAL = 6;
@@ -38,7 +38,7 @@ const MAX_EXPORTS_CHECKED = 200;
 const MAX_MANIFEST_LINES = 40;
 const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
-// `inComments` — сигнал ищется и в комментариях; остальные комментарии пропускают.
+// `inComments`: сигнал ищется и в комментариях; остальные комментарии пропускают.
 const RISKY_ADDITIONS = [
   { name: "необязательное поле или параметр `?:`, `Optional`", pattern: /\w\?:|\bOptional\[/ },
   { name: "`| undefined`, `| null`", pattern: /\|\s*(undefined|null)\b/ },
@@ -73,7 +73,7 @@ const RISKY_ADDITIONS = [
 
 const root = git(["rev-parse", "--show-toplevel"], process.cwd()).trim();
 const { range, paths } = parseArgs(process.argv.slice(2));
-// Сравнение с рабочим деревом (`HEAD`, `main`) не видит новых файлов вне git — их добавляем сами.
+// Сравнение с рабочим деревом (`HEAD`, `main`) не видит новых файлов вне git, поэтому их добавляем сами.
 const withWorktree = !range.includes("--cached") && !range.some((arg) => arg.includes(".."));
 const untracked = withWorktree ? untrackedFiles() : [];
 const changed = changedFiles();
@@ -143,7 +143,7 @@ function renamedTarget(path) {
   return path.replace(/\{[^{}]* => ([^{}]*)\}/, "$1").replace(/^.* => /, "").replace(/\/\//g, "/");
 }
 
-// Переименование — `R`, а не новый файл: перенесённый без изменений код новым не считается.
+// Переименование получает статус `R`, а не нового файла: перенесённый без изменений код новым не считается.
 function statusByPath() {
   return new Map(
     diff(["--name-status", "-M"])
@@ -276,7 +276,7 @@ function printFileRows(rows, title) {
   }
 }
 
-// Новый экспорт без единого упоминания вне своего файла — код без потребителя или лишний `export`.
+// Новый экспорт без единого упоминания вне своего файла означает код без потребителя или лишний `export`.
 function printUnusedExports(lines) {
   const exports = lines
     .filter((entry) => JS_FILE.test(entry.path))
@@ -335,7 +335,7 @@ function printCopies(files) {
   }
 }
 
-// Хеш содержимого на конце диапазона; нули — файл в рабочем дереве, его хеш считается с диска.
+// Хеш содержимого на конце диапазона; нули означают файл в рабочем дереве, его хеш считается с диска.
 function newBlobs() {
   const blobs = new Map();
 
@@ -359,7 +359,7 @@ function diskBlob(path) {
   return createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
 }
 
-// Изменённые строки манифестов: новые зависимости и входы пакетов — решение с причиной и правкой карты проекта.
+// Изменённые строки манифестов: новые зависимости и входы пакетов требуют причины и правки карты проекта.
 function printManifestChanges() {
   const lines = [];
   let path = "";
@@ -393,7 +393,7 @@ function printRiskyAdditions(lines) {
   );
 
   section(
-    "Добавленные конструкции: кто сегодня передаёт пусто (никто — сделать обязательным), какой контракт не выражен типом, что за костылём?",
+    "Добавленные конструкции: кто сегодня передаёт пусто (никто: сделать обязательным), какой контракт не выражен типом, что за костылём?",
   );
 
   if (hits.every((found) => found.length === 0)) {
@@ -438,7 +438,7 @@ function git(args, cwd = root) {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
 
-// `git grep` без совпадений завершается кодом 1 — это пустой результат, а не ошибка.
+// `git grep` без совпадений завершается кодом 1: это пустой результат, а не ошибка.
 function tryGit(args) {
   try {
     return git(args);

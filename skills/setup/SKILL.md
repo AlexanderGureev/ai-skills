@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Заготовка проекта под навыки spec, impl и review — AGENTS.md с разделами для правил проекта, CLAUDE.md с импортом AGENTS.md, папки spec/actual и spec/archive. Существующие файлы не перезаписывает.
+description: "Заготовка проекта под навыки spec, impl и review: AGENTS.md с разделами для правил проекта, CLAUDE.md с импортом AGENTS.md, папки spec/actual, spec/archive и docs. Существующие файлы не перезаписывает."
 disable-model-invocation: true
 ---
 
