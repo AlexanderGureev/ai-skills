@@ -11,7 +11,7 @@ echo "Проект: $root"
 
 if [ -e AGENTS.md ]; then
   missing=$(grep '^## ' "$template" | while IFS= read -r heading; do
-    grep -qxF "$heading" AGENTS.md || printf '  %s\n' "$heading"
+    tr -d '\r' < AGENTS.md | grep -qxF "$heading" || printf '  %s\n' "$heading"
   done)
 
   if [ -n "$missing" ]; then
@@ -19,9 +19,24 @@ if [ -e AGENTS.md ]; then
   else
     echo "AGENTS.md есть, не тронут: разделы шаблона на месте."
   fi
+
+  if ! grep -q 'review/principles\.md' AGENTS.md; then
+    echo "В AGENTS.md нет ссылки на review/principles.md: добавьте её по шаблону, если нужны общие принципы и вне навыков."
+  fi
 else
   cp "$template" AGENTS.md
   echo "AGENTS.md создан из шаблона: заполните разделы."
+fi
+
+had_other_specs=""
+if [ -d spec ]; then
+  for entry in spec/*; do
+    [ -e "$entry" ] || continue
+    case "$entry" in
+      spec/actual|spec/archive) ;;
+      *) had_other_specs=1; break ;;
+    esac
+  done
 fi
 
 for dir in spec/actual spec/archive docs; do
@@ -34,15 +49,12 @@ for dir in spec/actual spec/archive docs; do
   fi
 done
 
-# Claude Code читает AGENTS.md сам, только пока в проекте нет CLAUDE.md. CLAUDE.md с импортом держит AGENTS.md в
-# контексте и после того, как CLAUDE.md появится (например, от встроенного /init).
-if [ ! -e CLAUDE.md ] && [ ! -e .claude/CLAUDE.md ]; then
-  echo "@AGENTS.md" > CLAUDE.md
-  echo "CLAUDE.md создан: импортирует AGENTS.md."
+if [ -n "$had_other_specs" ]; then
+  echo "В spec/ уже есть другие файлы или папки: они не тронуты; навыки ведут задачи в spec/actual/ и spec/archive/."
 fi
 
-for claude in CLAUDE.md .claude/CLAUDE.md; do
-  if [ -e "$claude" ] && ! grep -q '@AGENTS.md' "$claude"; then
-    echo "В $claude нет строки @AGENTS.md: без неё Claude Code не читает AGENTS.md, добавьте её первой строкой."
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if git check-ignore -q spec/actual/001.md 2>/dev/null || git check-ignore -q spec/archive/001.md 2>/dev/null; then
+    echo "Внимание: spec/actual/ или spec/archive/ игнорируется в .gitignore; навык impl опирается на хранение спек в git."
   fi
-done
+fi

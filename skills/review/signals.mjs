@@ -5,12 +5,13 @@
 // незакоммиченное, с новыми файлами вне git), `HEAD~1..HEAD`, `main...`. После `--` идут пути: `HEAD -- src/a.ts`.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const CODE_FILE =
-  /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|vue|svelte|astro|py|go|rs|java|kt|kts|swift|rb|php|cs|c|cc|cpp|h|hpp|scala|dart|ex|exs|lua|sh)$/;
+  /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|vue|svelte|astro|py|go|rs|java|kt|kts|swift|rb|php|cs|c|cc|cpp|h|hpp|m|mm|scala|dart|ex|exs|erl|clj|zig|lua|groovy|sql|proto|graphql|gql|tf|hcl|sh|bash|zsh)$/;
 const JS_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|vue|svelte|astro)$/;
+const NON_NULL_BANG_SKIP = /\.(rb|ex|exs)$/;
 const GENERATED =
   /(^|\/)(generated|__generated__|gen|dist|build|out|vendor|node_modules|\.next|target)\/|\.(gen|g|freezed|generated|designer)\.|_pb2?\.|\.pb\.|\.min\.|(^|\/|-|\.)lock(file)?\.(json|yaml|yml)$|\.lock$/i;
 const TEST_FILE =
@@ -22,7 +23,7 @@ const HUB_NAME =
   /^(index|main|app|server|client|router|store|actions|registry|mod|lib|__init__|program|urls|appdelegate|mainactivity)\.\w+$/i;
 const HUB_PATTERN = /^(create[A-Z]\w*|\w+(Store|Codec|Registry|Router|Context|Provider|Module))\.\w+$|\.module\.\w+$/;
 const MANIFEST_FILE =
-  /(^|\/)(package\.json|pyproject\.toml|requirements[\w.-]*\.txt|go\.mod|Cargo\.toml|Gemfile|composer\.json|build\.gradle(\.kts)?|pom\.xml|pubspec\.yaml|Package\.swift|Podfile|libs\.versions\.toml|[\w.-]+\.csproj)$/;
+  /(^|\/)(package\.json|pyproject\.toml|requirements[\w.-]*\.txt|go\.mod|Cargo\.toml|Gemfile|composer\.json|mix\.exs|CMakeLists\.txt|build\.gradle(\.kts)?|pom\.xml|pubspec\.yaml|Package\.swift|Podfile|libs\.versions\.toml|[\w.-]+\.csproj)$/;
 const MANIFEST_VERSION = /^[+-]\s*"?version"?\s*[:=]/;
 const JS_EXPORT =
   /^\s*export\s+(?:default\s+)?(?:declare\s+)?(?:async\s+)?(?:function\*?|const|let|class|abstract\s+class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/;
@@ -37,6 +38,8 @@ const EXAMPLES_PER_SIGNAL = 6;
 const MAX_EXPORTS_CHECKED = 200;
 const MAX_MANIFEST_LINES = 40;
 const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+// Канонический пустой tree-объект git: позволяет строить дифф в новом репозитории без коммитов.
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 // `inComments`: сигнал ищется и в комментариях; остальные комментарии пропускают.
 const RISKY_ADDITIONS = [
@@ -52,12 +55,20 @@ const RISKY_ADDITIONS = [
     pattern: /[\w)\]] as (?:readonly |unknown\b|any\b|[A-Z[{(])|\bcast\(|:\s*any\b|<any>|\bAny\b|interface\{\}/,
     skip: /^\s*(import|export|from)\b|^\s*\w+ as \w+,?$/,
   },
-  { name: "non-null `!`, `unwrap()`", pattern: /[\w)]!(?=[.),;])|\.unwrap\(\)/ },
+  {
+    name: "non-null `!`, `unwrap()`",
+    pattern: /[\w)]!(?=[.),;])|\.unwrap\(\)/,
+    fileSkip: NON_NULL_BANG_SKIP,
+    fallbackPattern: /\.unwrap\(\)/,
+  },
   {
     name: "пустой или глотающий обработчик ошибки",
     pattern: /catch\s*(\(\s*\w*\s*\))?\s*\{\s*\}|except(\s+\w+)?\s*:\s*pass\b|\.catch\(\(\)\s*=>\s*(\{\s*\}|undefined|null)\)/,
   },
-  { name: "таймер или задержка", pattern: /\b(setTimeout|setInterval|requestIdleCallback|sleep|time\.sleep|delay)\(/ },
+  {
+    name: "таймер или задержка",
+    pattern: /\b(setTimeout|setInterval|requestIdleCallback|sleep|time\.[Ss]leep|Thread\.sleep|Task\.Delay|delay)\(/,
+  },
   {
     name: "отключённая проверка",
     pattern: /(eslint|oxlint|biome)-(disable|ignore)|@ts-(ignore|expect-error|nocheck)|#\s*type:\s*ignore|#\s*noqa|\/\/\s*nolint|#\[allow\(/,
@@ -71,25 +82,33 @@ const RISKY_ADDITIONS = [
   },
 ];
 
-const root = git(["rev-parse", "--show-toplevel"], process.cwd()).trim();
-const { range, paths } = parseArgs(process.argv.slice(2));
+const root = tryGit(["rev-parse", "--show-toplevel"], process.cwd()).trim();
+
+if (!root) {
+  console.log("Сигналы пропущены: каталог вне git-репозитория.");
+  process.exit(0);
+}
+
+const hasHead = Boolean(tryGit(["rev-parse", "--verify", "HEAD"]).trim());
+const { range, paths, label } = parseArgs(process.argv.slice(2));
+const endRef = resolveEndRef(range);
 // Сравнение с рабочим деревом (`HEAD`, `main`) не видит новых файлов вне git, поэтому их добавляем сами.
-const withWorktree = !range.includes("--cached") && !range.some((arg) => arg.includes(".."));
+const withWorktree = endRef.kind === "worktree";
 const untracked = withWorktree ? untrackedFiles() : [];
 const changed = changedFiles();
 
 if (changed.length === 0) {
-  console.log(`Нет изменений в диффе: git diff ${range.join(" ")}`);
+  console.log(`Нет изменений в диффе: git diff ${label}`);
   process.exit(0);
 }
 
 const code = changed.filter((file) => CODE_FILE.test(file.path));
 const added = addedLines(code);
 
-console.log(`Дифф: git diff ${range.join(" ")}${untracked.length > 0 ? ` и ${untracked.length} новых файлов вне git` : ""}`);
+console.log(`Дифф: git diff ${label}${untracked.length > 0 ? ` и ${untracked.length} новых файлов вне git` : ""}`);
 printModuleBalance(code);
 printGrowingFiles(code);
-printUnusedExports(added);
+printUnusedExports(code, added);
 printCopies(changed);
 printManifestChanges();
 printRiskyAdditions(added);
@@ -99,22 +118,49 @@ function parseArgs(args) {
   const rangeArgs = split === -1 ? args : args.slice(0, split);
   const pathArgs = split === -1 ? [] : args.slice(split + 1);
 
-  if (rangeArgs.length > 0) return { range: rangeArgs, paths: pathArgs };
+  if (rangeArgs.length > 0) {
+    if (!hasHead && rangeArgs.length === 1 && rangeArgs[0] === "HEAD") {
+      return { range: [EMPTY_TREE], paths: pathArgs, label: "(репозиторий без коммитов)" };
+    }
+
+    return { range: rangeArgs, paths: pathArgs, label: rangeArgs.join(" ") };
+  }
 
   // После реализации staged обычно пуст: тогда ревью идёт по всему незакоммиченному.
   const staged = git(["diff", "--cached", "--name-only", "--", ...pathArgs]).trim();
 
-  return { range: staged ? ["--cached"] : ["HEAD"], paths: pathArgs };
+  if (staged) return { range: ["--cached"], paths: pathArgs, label: "--cached" };
+  if (!hasHead) return { range: [EMPTY_TREE], paths: pathArgs, label: "(репозиторий без коммитов)" };
+
+  return { range: ["HEAD"], paths: pathArgs, label: "HEAD" };
+}
+
+function resolveEndRef(rangeArgs) {
+  if (rangeArgs.includes("--cached") || rangeArgs.includes("--staged")) return { kind: "index" };
+
+  const dotted = rangeArgs.find((arg) => arg.includes(".."));
+
+  if (dotted) {
+    const right = dotted.split(/\.{2,3}/).at(-1);
+
+    return { kind: "rev", rev: right || "HEAD" };
+  }
+
+  const revs = rangeArgs.filter((arg) => !arg.startsWith("-"));
+
+  if (revs.length >= 2) return { kind: "rev", rev: revs.at(-1) };
+
+  return { kind: "worktree" };
 }
 
 function diff(args) {
-  return git(["diff", ...args, ...range, "--", ...paths]);
+  return git(["diff", "--no-ext-diff", ...args, ...range, "--", ...paths]);
 }
 
 function untrackedFiles() {
   return git(["ls-files", "--others", "--exclude-standard", "--", ...paths])
     .split("\n")
-    .filter((path) => path && !GENERATED.test(path) && existsSync(join(root, path)));
+    .filter((path) => path && !GENERATED.test(path) && isRegularFile(join(root, path)));
 }
 
 function changedFiles() {
@@ -133,14 +179,19 @@ function changedFiles() {
         status: status.get(path) ?? "M",
       };
     });
-  const created = untracked.map((path) => ({ path, added: currentLines(path), removed: 0, status: "A" }));
+  const created = untracked.map((path) => ({
+    path,
+    added: CODE_FILE.test(path) ? lineCount(path) : 0,
+    removed: 0,
+    status: "A",
+  }));
 
   return [...tracked, ...created].filter((file) => !GENERATED.test(file.path));
 }
 
-// `--numstat -M` пишет переименование как `dir/{old => new}/file` или `old => new`.
+// `--numstat -M` пишет переименование как `dir/{old => new}/file`, `{dir => }/file` или `old => new`.
 function renamedTarget(path) {
-  return path.replace(/\{[^{}]* => ([^{}]*)\}/, "$1").replace(/^.* => /, "").replace(/\/\//g, "/");
+  return path.replace(/\{[^{}]* => ([^{}]*)\}/, "$1").replace(/^.* => /, "").replace(/\/\//g, "/").replace(/^\//, "");
 }
 
 // Переименование получает статус `R`, а не нового файла: перенесённый без изменений код новым не считается.
@@ -163,10 +214,17 @@ function addedLines(files) {
   const lines = [];
   let path = "";
   let line = 0;
+  let inHunk = false;
 
   for (const text of diff(["-U0", "-M"]).split("\n")) {
-    if (text.startsWith("+++ ")) {
-      path = text.slice(6);
+    if (text.startsWith("diff --git ")) {
+      path = "";
+      inHunk = false;
+      continue;
+    }
+
+    if (!inHunk && text.startsWith("+++ ")) {
+      path = text === "+++ /dev/null" ? "" : diffPath(text);
       continue;
     }
 
@@ -174,10 +232,11 @@ function addedLines(files) {
 
     if (hunk) {
       line = Number(hunk[1]);
+      inHunk = true;
       continue;
     }
 
-    if (!text.startsWith("+") || !product.has(path)) continue;
+    if (!inHunk || !text.startsWith("+") || !product.has(path)) continue;
 
     lines.push({ path, line, text: text.slice(1) });
     line += 1;
@@ -236,7 +295,7 @@ function printModuleBalance(files) {
 function printGrowingFiles(files) {
   const growing = files
     .filter((file) => file.status !== "D" && net(file) > 0)
-    .map((file) => ({ ...file, lines: currentLines(file.path) }));
+    .map((file) => ({ ...file, lines: lineCount(file.path) }));
   const big = growing.filter((file) => file.status !== "A" && grewNoticeably(file));
   const created = growing.filter((file) => file.status === "A" && file.lines >= BIG_GROWTH_LINES);
   const hubs = growing.filter((file) => isHub(basename(file.path)) && !TEST_FILE.test(file.path));
@@ -277,15 +336,22 @@ function printFileRows(rows, title) {
 }
 
 // Новый экспорт без единого упоминания вне своего файла означает код без потребителя или лишний `export`.
-function printUnusedExports(lines) {
+function printUnusedExports(files, lines) {
+  section("Новые экспорты без потребителя вне своего файла (JS/TS): снять export или удалить?");
+
+  const hasJsProduct = files.some((file) => JS_FILE.test(file.path) && !TEST_FILE.test(file.path));
+
+  if (!hasJsProduct) {
+    console.log("  пропущено (автопроверка экспортов только для JS/TS; для остальных языков проверить по usages)");
+    return;
+  }
+
   const exports = lines
     .filter((entry) => JS_FILE.test(entry.path))
     .map((entry) => ({ ...entry, name: JS_EXPORT.exec(entry.text)?.[1] }))
     .filter((entry) => entry.name)
     .slice(0, MAX_EXPORTS_CHECKED);
   const unused = exports.filter((entry) => usagesOutside(entry.name, entry.path) === 0);
-
-  section("Новые экспорты без потребителя вне своего файла (JS/TS): снять export или удалить?");
 
   if (exports.length === 0) {
     console.log("  новых экспортов нет");
@@ -303,9 +369,18 @@ function printUnusedExports(lines) {
 }
 
 function usagesOutside(name, path) {
-  const found = tryGit(["grep", "-l", "-w", "--untracked", "-e", name, "--", ".", `:(exclude)${path}`]);
+  const args =
+    endRef.kind === "rev"
+      ? ["grep", "-l", "-w", "-e", name, endRef.rev, "--", ".", `:(exclude)${path}`]
+      : endRef.kind === "index"
+        ? ["grep", "-l", "-w", "--cached", "-e", name, "--", ".", `:(exclude)${path}`]
+        : ["grep", "-l", "-w", "--untracked", "-e", name, "--", ".", `:(exclude)${path}`];
+  const found = tryGit(args);
 
-  return found.split("\n").filter((file) => file && !GENERATED.test(file)).length;
+  return found
+    .split("\n")
+    .map((line) => (endRef.kind === "rev" ? line.replace(/^[^:]+:/, "") : line))
+    .filter((file) => file && !GENERATED.test(file)).length;
 }
 
 // Одинаковые новые файлы: копии данных, фикстур, конфигов и кода вместо общего источника.
@@ -340,7 +415,7 @@ function newBlobs() {
   const blobs = new Map();
 
   for (const line of diff(["--raw", "--no-abbrev", "-M"]).split("\n")) {
-    const match = /^:\S+ \S+ \S+ (\w{40}) A\t(.+)$/.exec(line);
+    const match = /^:\S+ \S+ \S+ (\w{40,64}) A\t(.+)$/.exec(line);
 
     if (match && !/^0+$/.test(match[1])) blobs.set(match[2], match[1]);
   }
@@ -352,29 +427,53 @@ function newBlobs() {
 function diskBlob(path) {
   const full = join(root, path);
 
-  if (!existsSync(full)) return undefined;
+  if (!isRegularFile(full)) return undefined;
 
   const content = readFileSync(full);
 
   return createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
 }
 
-// Изменённые строки манифестов: новые зависимости и входы пакетов требуют причины и правки карты проекта.
+// Изменённые и новые манифесты: новые зависимости и входы пакетов требуют причины и правки карты проекта.
 function printManifestChanges() {
   const lines = [];
   let path = "";
+  let inHunk = false;
 
   for (const line of diff(["-U0", "-M"]).split("\n")) {
-    if (line.startsWith("+++ ")) {
-      path = line.slice(6);
+    if (line.startsWith("diff --git ")) {
+      path = "";
+      inHunk = false;
       continue;
     }
 
-    if (line.startsWith("---") || !/^[+-]\s*\S/.test(line) || !MANIFEST_FILE.test(path) || MANIFEST_VERSION.test(line)) {
+    if (!inHunk && line.startsWith("+++ ")) {
+      path = line === "+++ /dev/null" ? "" : diffPath(line);
+      continue;
+    }
+
+    if (/^@@ -\S+ \+\d+/.test(line)) {
+      inHunk = true;
+      continue;
+    }
+
+    if (!inHunk || !/^[+-]\s*\S/.test(line) || !MANIFEST_FILE.test(path) || MANIFEST_VERSION.test(line)) {
       continue;
     }
 
     lines.push(`    ${path}: ${line.trim()}`);
+  }
+
+  for (const file of untracked) {
+    if (!MANIFEST_FILE.test(file)) continue;
+
+    lines.push(`    ${file}: (новый файл)`);
+
+    for (const text of readFileSync(join(root, file), "utf8").split("\n")) {
+      const trimmed = text.trim();
+
+      if (trimmed && !MANIFEST_VERSION.test(`+${trimmed}`)) lines.push(`    ${file}: +${trimmed}`);
+    }
   }
 
   section("Манифесты: новая зависимость или вход пакета обоснованы и отражены в карте проекта?");
@@ -384,12 +483,13 @@ function printManifestChanges() {
 // Добавленные конструкции, которые чаще всего прячут неявный контракт, ветку без потребителя или костыль.
 function printRiskyAdditions(lines) {
   const hits = RISKY_ADDITIONS.map((signal) =>
-    lines.filter(
-      (entry) =>
-        (signal.inComments || !COMMENT_LINE.test(entry.text)) &&
-        signal.pattern.test(entry.text) &&
-        !signal.skip?.test(entry.text),
-    ),
+    lines.filter((entry) => {
+      if (!signal.inComments && COMMENT_LINE.test(entry.text)) return false;
+
+      const pattern = signal.fileSkip?.test(entry.path) ? signal.fallbackPattern : signal.pattern;
+
+      return Boolean(pattern?.test(entry.text)) && !signal.skip?.test(entry.text);
+    }),
   );
 
   section(
@@ -416,10 +516,29 @@ function printRiskyAdditions(lines) {
   });
 }
 
-function currentLines(path) {
+function lineCount(path) {
+  const content = readAtEnd(path);
+
+  if (!content) return 0;
+
+  return content.replace(/\n$/, "").split("\n").length;
+}
+
+function readAtEnd(path) {
+  if (endRef.kind === "rev") return tryGit(["show", `${endRef.rev}:${path}`]);
+  if (endRef.kind === "index") return tryGit(["show", `:${path}`]);
+
   const file = join(root, path);
 
-  return existsSync(file) ? readFileSync(file, "utf8").split("\n").length - 1 : 0;
+  return isRegularFile(file) ? readFileSync(file, "utf8") : "";
+}
+
+function isRegularFile(file) {
+  try {
+    return lstatSync(file).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function net(entry) {
@@ -434,16 +553,30 @@ function section(title) {
   console.log(`\n## ${title}`);
 }
 
-function git(args, cwd = root) {
-  return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+// В `+++ b/path` git добавляет табуляцию в конце, если в пути есть пробел.
+function diffPath(header) {
+  return header.slice(6).replace(/\t$/, "");
 }
 
-// `git grep` без совпадений завершается кодом 1: это пустой результат, а не ошибка.
-function tryGit(args) {
+function git(args, cwd = root, silentStderr = false) {
+  return execFileSync(
+    "git",
+    ["-c", "core.quotepath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", ...args],
+    {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: silentStderr ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "inherit"],
+    },
+  );
+}
+
+// `git grep` без совпадений завершается кодом 1, а `git show`/`rev-parse` — ненулевым кодом: возвращаем пустую строку.
+function tryGit(args, cwd = root) {
   try {
-    return git(args);
+    return git(args, cwd, true);
   } catch (error) {
-    if (error.status === 1) return "";
+    if (error.status === 1 || error.status === 128) return "";
 
     throw error;
   }
