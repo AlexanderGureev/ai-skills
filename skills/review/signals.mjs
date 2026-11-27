@@ -6,7 +6,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, posix } from "node:path";
 
 const CODE_FILE =
   /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|vue|svelte|astro|py|go|rs|java|kt|kts|swift|rb|php|cs|c|cc|cpp|h|hpp|m|mm|scala|dart|ex|exs|erl|clj|zig|lua|groovy|sql|proto|graphql|gql|tf|hcl|sh|bash|zsh)$/;
@@ -27,6 +27,8 @@ const MANIFEST_FILE =
 const MANIFEST_VERSION = /^[+-]\s*"?version"?\s*[:=]/;
 const JS_EXPORT =
   /^\s*export\s+(?:default\s+)?(?:declare\s+)?(?:async\s+)?(?:function\*?|const|let|class|abstract\s+class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/;
+const JS_NAMED_EXPORT_BLOCK = /^[ \t]*export\s+(?:type\s+)?\{([^{}]*)\}(?:\s*from\s*["']([^"']+)["'])?/gm;
+const JS_NAMED_EXPORT_ITEM = /^(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/;
 // `#` считается комментарием только с пробелом: `#private` в TS и `#include` в C являются кодом.
 const COMMENT_LINE = /^\s*(\/\/|#(\s|$)|\*|\/\*|--\s)/;
 const LARGE_FILE_LINES = 600;
@@ -35,7 +37,7 @@ const BIG_GROWTH_LINES = 150;
 const RELATIVE_GROWTH = 0.25;
 const RELATIVE_GROWTH_LINES = 60;
 const EXAMPLES_PER_SIGNAL = 6;
-const MAX_EXPORTS_CHECKED = 200;
+const MAX_EXPORTS_CHECKED = 300;
 const MAX_MANIFEST_LINES = 40;
 const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 // Канонический пустой tree-объект git: позволяет строить дифф в новом репозитории без коммитов.
@@ -335,40 +337,201 @@ function printFileRows(rows, title) {
   }
 }
 
-// Новый экспорт без единого упоминания вне своего файла означает код без потребителя или лишний `export`.
+// Новый экспорт без потребителя в продуктовом коде означает код без потребителя, лишний `export` или утечку фасада.
 function printUnusedExports(files, lines) {
-  section("Новые экспорты без потребителя вне своего файла (JS/TS): снять export или удалить?");
+  section("Новые экспорты без потребителя в продуктовом коде (JS/TS): снять export или удалить?");
 
-  const hasJsProduct = files.some((file) => JS_FILE.test(file.path) && !TEST_FILE.test(file.path));
+  const hasJsProduct = files.some((file) => file.status !== "D" && JS_FILE.test(file.path) && !TEST_FILE.test(file.path));
 
   if (!hasJsProduct) {
     console.log("  пропущено (автопроверка экспортов только для JS/TS; для остальных языков проверить по usages)");
     return;
   }
 
-  const exports = lines
-    .filter((entry) => JS_FILE.test(entry.path))
-    .map((entry) => ({ ...entry, name: JS_EXPORT.exec(entry.text)?.[1] }))
-    .filter((entry) => entry.name)
-    .slice(0, MAX_EXPORTS_CHECKED);
-  const unused = exports.filter((entry) => usagesOutside(entry.name, entry.path) === 0);
+  const exports = collectJsExports(files, lines);
 
   if (exports.length === 0) {
     console.log("  новых экспортов нет");
     return;
   }
 
-  if (unused.length === 0) {
+  const dead = [];
+  const testOnly = [];
+
+  for (const entry of exports) {
+    const usage = usagesOutside(entry.name, entry.path, entry.sourceStems);
+
+    if (usage.prod > 0) continue;
+
+    if (usage.test > 0) testOnly.push({ ...entry, testCount: usage.test });
+    else dead.push(entry);
+  }
+
+  if (dead.length === 0 && testOnly.length === 0) {
     console.log(`  нет (проверено ${exports.length})`);
     return;
   }
 
-  for (const entry of unused) {
-    console.log(`    ${entry.path}:${entry.line}  ${entry.name}`);
+  if (dead.length > 0) {
+    console.log("  без потребителя вне своего файла:");
+
+    for (const entry of dead) {
+      const kind = entry.reexport ? "  (реэкспорт)" : "";
+
+      console.log(`    ${entry.path}:${entry.line}  ${entry.name}${kind}`);
+    }
+  }
+
+  if (testOnly.length > 0) {
+    console.log("  только в тестах (проверить, нужен ли экспорт в фасаде или продуктовом коде):");
+
+    for (const entry of testOnly) {
+      const kind = entry.reexport ? "  (реэкспорт)" : "";
+
+      console.log(`    ${entry.path}:${entry.line}  ${entry.name}${kind}  [тестов: ${entry.testCount}]`);
+    }
   }
 }
 
-function usagesOutside(name, path) {
+function collectJsExports(files, lines) {
+  const seen = new Set();
+  const result = [];
+  const addedByFile = new Map();
+
+  for (const entry of lines) {
+    if (!JS_FILE.test(entry.path)) continue;
+
+    let set = addedByFile.get(entry.path);
+
+    if (!set) {
+      set = new Set();
+      addedByFile.set(entry.path, set);
+    }
+
+    set.add(entry.line);
+
+    const name = JS_EXPORT.exec(entry.text)?.[1];
+
+    if (!name) continue;
+
+    const key = `${entry.path}:${name}`;
+
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    result.push({ path: entry.path, line: entry.line, name, reexport: false });
+  }
+
+  for (const file of files) {
+    if (file.status === "D" || !JS_FILE.test(file.path) || TEST_FILE.test(file.path)) continue;
+
+    const addedLinesSet = addedByFile.get(file.path);
+
+    if (!addedLinesSet) continue;
+
+    for (const entry of collectNamedBlockExports(file.path, addedLinesSet)) {
+      const key = `${entry.path}:${entry.name}`;
+
+      if (seen.has(key)) continue;
+
+      seen.add(key);
+      result.push(entry);
+    }
+  }
+
+  return result.slice(0, MAX_EXPORTS_CHECKED);
+}
+
+// Собирает именованные `export { ... }` и реэкспорты фасадов `export { ... } from "..."`, чьи строки добавлены в диффе.
+function collectNamedBlockExports(filePath, addedLinesSet) {
+  const raw = readAtEnd(filePath);
+
+  if (!raw) return [];
+
+  const stripped = stripJsCommentsPreservingLines(raw);
+  const found = [];
+
+  for (const match of stripped.matchAll(JS_NAMED_EXPORT_BLOCK)) {
+    const body = match[1];
+    const fromSpec = match[2];
+    const openBraceOffset = match.index + match[0].indexOf("{") + 1;
+    const sourceStems = fromSpec ? resolveSourceStems(filePath, fromSpec) : [];
+    const reexport = Boolean(fromSpec);
+    let cursor = 0;
+
+    for (const part of body.split(",")) {
+      const itemOffset = openBraceOffset + cursor;
+
+      cursor += part.length + 1;
+
+      const trimmed = part.trim();
+
+      if (!trimmed) continue;
+
+      const parsed = JS_NAMED_EXPORT_ITEM.exec(trimmed);
+
+      if (!parsed) continue;
+
+      const name = parsed[2] ?? parsed[1];
+
+      if (name === "default") continue;
+
+      const itemLine = lineNumberAt(stripped, itemOffset + part.indexOf(trimmed));
+
+      if (!addedLinesSet.has(itemLine)) continue;
+
+      found.push({ path: filePath, line: itemLine, name, reexport, sourceStems });
+    }
+  }
+
+  return found;
+}
+
+function stripJsCommentsPreservingLines(source) {
+  return source.replace(
+    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\/\/[^\n]*|\/\*[\s\S]*?\*\//g,
+    (match, quoted) => (quoted ? match : match.replace(/[^\n]/g, " ")),
+  );
+}
+
+function lineNumberAt(text, offset) {
+  let line = 1;
+
+  for (let index = 0; index < offset; index += 1) {
+    if (text.charCodeAt(index) === 10) line += 1;
+  }
+
+  return line;
+}
+
+function resolveSourceStems(filePath, specifier) {
+  if (specifier.startsWith("./") || specifier.startsWith("../")) {
+    const dir = posix.dirname(filePath);
+    const combined = dir === "." ? specifier : posix.join(dir, specifier);
+
+    return [stripJsExt(posix.normalize(combined))];
+  }
+
+  if (specifier.startsWith("@/") || specifier.startsWith("~/")) {
+    const stem = stripJsExt(posix.normalize(specifier.slice(2)));
+
+    return [stem, `src/${stem}`];
+  }
+
+  return [];
+}
+
+function stripJsExt(filePath) {
+  return filePath.replace(/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/, "");
+}
+
+function matchesAnyStem(filePath, stems) {
+  const stripped = stripJsExt(filePath);
+
+  return stems.some((stem) => stripped === stem || stripped === `${stem}/index`);
+}
+
+function usagesOutside(name, path, sourceStems = []) {
   const args =
     endRef.kind === "rev"
       ? ["grep", "-l", "-w", "-e", name, endRef.rev, "--", ".", `:(exclude)${path}`]
@@ -376,11 +539,20 @@ function usagesOutside(name, path) {
         ? ["grep", "-l", "-w", "--cached", "-e", name, "--", ".", `:(exclude)${path}`]
         : ["grep", "-l", "-w", "--untracked", "-e", name, "--", ".", `:(exclude)${path}`];
   const found = tryGit(args);
+  let prod = 0;
+  let test = 0;
 
-  return found
-    .split("\n")
-    .map((line) => (endRef.kind === "rev" ? line.replace(/^[^:]+:/, "") : line))
-    .filter((file) => file && !GENERATED.test(file)).length;
+  for (const line of found.split("\n")) {
+    const file = endRef.kind === "rev" ? line.replace(/^[^:]+:/, "") : line;
+
+    if (!file || !CODE_FILE.test(file) || GENERATED.test(file)) continue;
+    if (sourceStems.length > 0 && matchesAnyStem(file, sourceStems)) continue;
+
+    if (TEST_FILE.test(file)) test += 1;
+    else prod += 1;
+  }
+
+  return { prod, test };
 }
 
 // Одинаковые новые файлы: копии данных, фикстур, конфигов и кода вместо общего источника.
